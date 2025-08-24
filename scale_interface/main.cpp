@@ -12,10 +12,37 @@
 #include <thread>
 #include <atomic>
 #include <csignal>
+#include <boost/regex.hpp>
 
 #include <boost/asio.hpp>
 #include <iostream>
 #include <string>
+
+
+#include "dynamixel_sdk.h"                                  // Uses DYNAMIXEL SDK library
+
+// Control table address
+#define ADDR_PRO_TORQUE_ENABLE          64                 // Control table address is different in Dynamixel model
+#define ADDR_PRO_GOAL_POSITION          116
+#define ADDR_PRO_PRESENT_POSITION       132
+
+// Protocol version
+#define PROTOCOL_VERSION                2.0                 // See which protocol version is used in the Dynamixel
+
+// Default setting
+#define DXL_ID                          1                   // Dynamixel ID: 1
+#define BAUDRATE                        1000000
+#define DEVICENAME                      "COM5"      // Check which port is being used on your controller
+                                                            // ex) Windows: "COM1"   Linux: "/dev/ttyUSB0"
+
+#define TORQUE_ENABLE                   1                   // Value for enabling the torque
+#define TORQUE_DISABLE                  0                   // Value for disabling the torque
+//#define DXL_MINIMUM_POSITION_VALUE      -150000             // Dynamixel will rotate between this value
+//#define DXL_MAXIMUM_POSITION_VALUE      150000              // and this value (note that the Dynamixel would not move when the position value is out of movable range. Check e-manual about the range of the Dynamixel you use.)
+//#define DXL_MOVING_STATUS_THRESHOLD     20                  // Dynamixel moving status threshold
+
+#define ESC_ASCII_VALUE                 0x1b
+
 
 namespace asio = boost::asio;
 using asio::steady_timer;
@@ -31,6 +58,28 @@ namespace asio = boost::asio;
 using asio::serial_port;
 using asio::steady_timer;
 using namespace std::chrono_literals;
+
+std::atomic<int> goal_pos;
+
+
+int mapWeightToServo(int weight3)
+{
+    // Input range
+    const int in_min = -250000;
+    const int in_max = -400000;  // smaller number
+    // Output range
+    const int out_min = 50;
+    const int out_max = 550;
+
+    // Ensure weight3 stays inside input range
+    if (weight3 > in_min) weight3 = in_min;
+    if (weight3 < in_max) weight3 = in_max;
+
+    // Linear interpolation
+    double scale = double(out_max - out_min) / double(in_max - in_min);
+    return int(out_min + (weight3 - in_min) * scale);
+}
+
 
 class SerialAsyncHandler {
 public:
@@ -57,7 +106,36 @@ private:
                     std::istream is(&read_buffer_);
                     std::string line;
                     std::getline(is, line);
-                    std::cout << "Received: " << line << std::endl;
+
+                    boost::regex re(
+                        R"(hx,(-?\d+),(-?\d+),(-?\d+),(-?\d+),fwd:(-?\d+),bkw:(-?\d+).*)"
+                    );
+
+                    boost::smatch match;
+                    if (boost::regex_match(line, match, re)) {
+                        int weight1 = std::stoi(match[1]);
+                        int weight2 = std::stoi(match[2]);
+                        int weight3 = std::stoi(match[3]);
+                        int weight4 = std::stoi(match[4]);
+                        int ticks_forward = std::stoi(match[5]);
+                        int ticks_backward = std::stoi(match[6]);
+
+                        std::cout << "w1=" << weight1
+                            << " w2=" << weight2
+                            << " w3=" << weight3
+                            << " w4=" << weight4
+                            << " fwd=" << ticks_forward
+                            << " bkw=" << ticks_backward
+                            << std::endl;
+
+                        goal_pos.store(mapWeightToServo(weight3));
+                    }
+                    else
+                    {
+                        std::cout << "Received: " << line << std::endl;
+                    }
+
+         
                     start_read();  // continue reading
                 }
                 else {
@@ -91,9 +169,117 @@ private:
 };
 
 
+std::atomic<bool> running(true);
+
+
+void servo_thread()
+{
+    // Initialize PortHandler instance
+    dynamixel::PortHandler* portHandler = dynamixel::PortHandler::getPortHandler(DEVICENAME);
+
+    // Initialize PacketHandler instance
+    dynamixel::PacketHandler* packetHandler = dynamixel::PacketHandler::getPacketHandler(PROTOCOL_VERSION);
+
+    int index = 0;
+    int dxl_comm_result = COMM_TX_FAIL;             // Communication result
+    uint8_t dxl_error = 0;                          // Dynamixel error
+    int32_t dxl_present_position = 0;               // Present position
+
+    // Open port
+    if (portHandler->openPort())
+    {
+        printf("Succeeded to open the port!\n");
+    }
+    else
+    {
+        printf("Failed to open the port!\n");
+        return;
+    }
+
+    // Enable Torque
+    dxl_comm_result = packetHandler->write1ByteTxRx(
+        portHandler, DXL_ID, ADDR_PRO_TORQUE_ENABLE, TORQUE_ENABLE, &dxl_error);
+
+    if (dxl_comm_result != COMM_SUCCESS || dxl_error != 0)
+    {
+        printf("Failed to enable torque\n");
+        return;
+    }
+    else
+    {
+        printf("Dynamixel has been successfully connected\n");
+    }
+
+    while (running)
+    {
+        dxl_comm_result = packetHandler->write4ByteTxRx(
+            portHandler, DXL_ID, ADDR_PRO_GOAL_POSITION, goal_pos.load(), &dxl_error);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        dxl_comm_result = packetHandler->read4ByteTxRx(
+            portHandler, DXL_ID, ADDR_PRO_PRESENT_POSITION,
+            (uint32_t*)&dxl_present_position, &dxl_error);
+
+        if (dxl_comm_result != COMM_SUCCESS || dxl_error != 0)
+            printf("read fail\n");
+        else
+            printf("[ID:%03d] GoalPos:%03d  PresPos:%03d\n", DXL_ID, 50, dxl_present_position);
+    }
+
+
+    /*
+    while (running)
+    {
+        // Move to position 50
+        dxl_comm_result = packetHandler->write4ByteTxRx(
+            portHandler, DXL_ID, ADDR_PRO_GOAL_POSITION, 50, &dxl_error);
+
+        while (running && std::abs(dxl_present_position - 50) > 3)
+        {
+            dxl_comm_result = packetHandler->read4ByteTxRx(
+                portHandler, DXL_ID, ADDR_PRO_PRESENT_POSITION,
+                (uint32_t*)&dxl_present_position, &dxl_error);
+
+            if (dxl_comm_result != COMM_SUCCESS || dxl_error != 0)
+                printf("read fail\n");
+            else
+                printf("[ID:%03d] GoalPos:%03d  PresPos:%03d\n", DXL_ID, 50, dxl_present_position);
+        }
+
+        // Move to position 540
+        dxl_comm_result = packetHandler->write4ByteTxRx(
+            portHandler, DXL_ID, ADDR_PRO_GOAL_POSITION, 540, &dxl_error);
+
+        while (running && std::abs(dxl_present_position - 540) > 3)
+        {
+            dxl_comm_result = packetHandler->read4ByteTxRx(
+                portHandler, DXL_ID, ADDR_PRO_PRESENT_POSITION,
+                (uint32_t*)&dxl_present_position, &dxl_error);
+
+            if (dxl_comm_result != COMM_SUCCESS || dxl_error != 0)
+                printf("read fail\n");
+            else
+                printf("[ID:%03d] GoalPos:%03d  PresPos:%03d\n", DXL_ID, 540, dxl_present_position);
+        }
+    }
+    */
+
+    // Cleanup
+    portHandler->closePort();
+}
+
+
+
+
 int main() {
     scale_interface scale;
     scale.start();
+
+    goal_pos.store(50);
+
+
+    std::thread t(servo_thread);
 
 
     try {
@@ -104,6 +290,10 @@ int main() {
     catch (const std::exception& e) {
         std::cerr << "Fatal error: " << e.what() << std::endl;
     }
+
+
+
+   
 
 
     auto start_time = std::chrono::steady_clock::now();
