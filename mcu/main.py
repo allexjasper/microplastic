@@ -492,12 +492,10 @@ backward_count = 0
 def handler_a(pin):
     global forward_count
     forward_count += 1
-    print("hello")
     
 def handler_b(pin):
     global backward_count
     backward_count += 1
-    print("hello")
     
 oe = Pin(2, Pin.OUT, value=0)
 
