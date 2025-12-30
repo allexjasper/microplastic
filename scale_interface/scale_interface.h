@@ -11,6 +11,11 @@
 
 class scale_interface {
 public:
+
+    struct WeightData {
+        int values[4];
+    };
+
     scale_interface();
     ~scale_interface() noexcept;
 
@@ -21,8 +26,8 @@ public:
     scale_interface& operator=(scale_interface&&) = delete;
 
     float get_scale_angle() const;
-    int get_last_weight_reading() const;
-    int get_tare() const;
+    WeightData get_last_weight_reading() const;
+    WeightData get_tare() const;
     bool is_ready() const;
 
     void reset();
@@ -38,13 +43,15 @@ public:
 
     static constexpr const char* _serial_port = "/dev/ttyUSB0";
 
+   
+
     struct SharedData {
 
         std::atomic<float>   servo_goal{ 0 };
         std::atomic<float>   servo_actual{ 28.0 };
         std::atomic<bool>    running{ false };
         std::atomic<float>   target_angle{ 60.0f };
-        std::atomic<int>     tare{ 0 };
+        std::atomic<WeightData>     tare{ WeightData{ {0, 0, 0, 0} } };
         std::atomic<bool>    is_resetting{ false };
 
 

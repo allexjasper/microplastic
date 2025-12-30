@@ -166,28 +166,54 @@ public:
         }
     }
 
-    std::atomic<int> last_reading{ 0 };
+    std::atomic<scale_interface::WeightData> last_reading{ scale_interface::WeightData{0,0,0,0} };
 
-    int compute_tare() {
-        std::vector<int> temp_view;
+    scale_interface::WeightData compute_tare() {
+        // We need 4 separate vectors to sort/median each channel independently
+        std::array<std::vector<int>, 4> channels;
 
-        // 1. Copy data under lock
+        // 1. Copy and Transpose data under lock
         {
             std::lock_guard<std::mutex> lock(buffer_mutex_);
+
             if (history_buffer_.empty()) {
-                return 0;
+                return scale_interface::WeightData{ {0, 0, 0, 0} };
             }
-            // Copy deque to vector for sorting
-            // We copy because we cannot rearrange the live history buffer 
-            // (it must remain in chronological order for the sliding window).
-            temp_view.assign(history_buffer_.begin(), history_buffer_.end());
+
+            // Pre-allocate memory to prevent reallocations during the loop
+            size_t n_samples = history_buffer_.size();
+            for (auto& ch : channels) {
+                ch.reserve(n_samples);
+            }
+
+            // Iterate through history and split values into separate channels
+            for (const auto& item : history_buffer_) {
+                for (int i = 0; i < 4; ++i) {
+                    channels[i].push_back(item.values[i]);
+                }
+            }
+        } // Mutex releases here. Sorting is heavy, so we do it unlocked.
+
+        // 2. Compute Median for each channel independently
+        scale_interface::WeightData result;
+
+        for (int i = 0; i < 4; ++i) {
+            std::vector<int>& current_view = channels[i];
+
+            // Find the median index
+            size_t mid_index = current_view.size() / 2;
+
+            // nth_element sorts just enough to put the median in the correct spot
+            std::nth_element(
+                current_view.begin(),
+                current_view.begin() + mid_index,
+                current_view.end()
+            );
+
+            result.values[i] = current_view[mid_index];
         }
 
-        // 2. Find Median
-        size_t n = temp_view.size() / 2;
-        std::nth_element(temp_view.begin(), temp_view.begin() + n, temp_view.end());
-
-        return temp_view[n];
+        return result;
     }
 
 
@@ -202,7 +228,7 @@ private:
     std::thread io_thread_;
 
     std::mutex buffer_mutex_;
-    std::deque<int> history_buffer_; // Changed to std::deque
+    std::deque<scale_interface::WeightData> history_buffer_; // Changed to std::deque
     const size_t max_history_size_ = 20;
 
     void start_read() {
@@ -220,13 +246,13 @@ private:
                         int total = std::stoi(match[1]) + std::stoi(match[2]) +
                             std::stoi(match[3]) + std::stoi(match[4]);
 
-                        last_reading.store(total);
+                        last_reading.store(scale_interface::WeightData{ std::stoi(match[1]), std::stoi(match[2]), std::stoi(match[3]), std::stoi(match[4]) });
 
                         {
                             std::lock_guard<std::mutex> lock(buffer_mutex_);
 
                             // Add new reading
-                            history_buffer_.push_back(total);
+                            history_buffer_.push_back(scale_interface::WeightData{ std::stoi(match[1]), std::stoi(match[2]), std::stoi(match[3]), std::stoi(match[4]) });
 
                             // Enforce sliding window size manually
                             if (history_buffer_.size() > max_history_size_) {
@@ -300,7 +326,7 @@ scale_interface::scale_interface()
 void scale_interface::empty_scale()
 {
     _data->is_resetting.store(true);
-    _data->tare.store(0);
+    _data->tare.store(scale_interface::WeightData{ 0,0,0,0 });
     _data->servo_goal.store(0.0);
     std::thread t([this]() {
         if (g_serialAsyncHandler)
@@ -352,17 +378,17 @@ float scale_interface::get_scale_angle() const {
     return angle;
 }
 
-int scale_interface::get_last_weight_reading() const
+scale_interface::WeightData scale_interface::get_last_weight_reading() const
 {
     return g_serialAsyncHandler->last_reading.load();
 }
 
 bool scale_interface::is_ready() const
 {
-    return !_data->is_resetting.load() && _data->tare != 0;
+    return !_data->is_resetting.load() && _data->tare.load().values[0] != 0;
 }
 
-int scale_interface::get_tare() const
+scale_interface::WeightData scale_interface::get_tare() const
 {
     return _data->tare.load();
 }
@@ -524,9 +550,19 @@ void scale_interface::sync_servo()
                 float goalAngle = 0;
 
 
-                if (is_ready() && get_tare() != 0)
+                if (is_ready() && get_tare().values[0] != 0)
                 {
-                    int weight = std::max(get_last_weight_reading() - get_tare(), 0);
+                    WeightData reading = get_last_weight_reading();
+                    WeightData current_tare = get_tare();
+
+                    // 2. Form the difference for each reading, then sum
+                    int total_diff = 0;
+                    for (int i = 0; i < 4; ++i) {
+                        total_diff += (reading.values[i] - current_tare.values[i]);
+                    }
+
+                    // 3. Clamp result so weight doesn't go negative
+                    int weight = std::max(total_diff, 0);
                     goalAngle = std::min(((float)weight / (float)maxWeight) * maxAngle, maxAngle);
 
                     std::cout << "goal angle: " << goalAngle << std::endl;
